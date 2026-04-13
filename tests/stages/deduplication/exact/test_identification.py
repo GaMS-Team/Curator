@@ -1,3 +1,5 @@
+# modality: text
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,28 +14,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ruff: noqa: E402
-
+from contextlib import suppress
 from pathlib import Path
 from typing import Literal
 
 import pytest
 
-cudf = pytest.importorskip("cudf")
+# Suppress GPU-related import errors when running pytest -m "not gpu"
+with suppress(ImportError):
+    import cudf
+
 import numpy as np
 import pandas as pd
 import ray
 
-from nemo_curator.backends.experimental.ray_actor_pool import RayActorPoolExecutor
-from nemo_curator.pipeline import Pipeline
-from nemo_curator.stages.deduplication.exact.identification import ExactDuplicateIdentification
-from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR, get_id_generator_actor
+# Suppress GPU-related import errors when running pytest -m "not gpu"
+with suppress(ImportError):
+    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+    from nemo_curator.pipeline import Pipeline
+    from nemo_curator.stages.deduplication.exact.identification import ExactDuplicateIdentification
+    from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR, get_id_generator_actor
+
 from nemo_curator.tasks import FileGroupTask
 
 
 def get_original_df_with_curator_ids(
     tasks: list[FileGroupTask], filetype: Literal["parquet", "jsonl"]
-) -> cudf.DataFrame:
+) -> "cudf.DataFrame":
     """Get mapping from curator IDs to original IDs using IDGeneratorActor.
     Args:
         tasks: List of tasks that were processed
@@ -111,10 +118,14 @@ def exact_no_dedup_data_jsonl(tmp_path: Path) -> list[FileGroupTask]:
 @pytest.mark.gpu
 @pytest.mark.usefixtures("ray_client_with_id_generator")
 class TestExactDuplicates:
-    @pytest.mark.parametrize("assign_id", [True, False])
-    @pytest.mark.parametrize("total_nparts", [2, 4])
+    @pytest.mark.parametrize(("assign_id", "total_nparts", "batch_size"), [(False, 2, 1), (True, 4, 5)])
     def test_dup(
-        self, exact_dedup_data_parquet: list[FileGroupTask], tmpdir: Path, total_nparts: int, assign_id: bool
+        self,
+        exact_dedup_data_parquet: list[FileGroupTask],
+        tmpdir: Path,
+        total_nparts: int,
+        assign_id: bool,
+        batch_size: int,
     ) -> None:
         stage = ExactDuplicateIdentification(
             text_field="text",
@@ -126,7 +137,7 @@ class TestExactDuplicates:
             enable_statistics=False,
             assign_id=assign_id,
             id_field="id" if not assign_id else None,
-        )
+        ).with_(batch_size=batch_size)
         pipeline = Pipeline(name="test_exact_dedup", stages=[stage])
         executor = RayActorPoolExecutor()
         pipeline.run(executor, initial_tasks=exact_dedup_data_parquet)

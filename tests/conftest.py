@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,20 +19,18 @@ GPU resources based on the test session's requirements.
 """
 
 import os
-import socket
+import re
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
 import ray
 from loguru import logger
 
+from nemo_curator.core.client import RayClient
 
-def find_free_port() -> int:
-    """Find an available port on the system."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+MODALITY_GROUPS = ["text", "image", "video", "audio"]
 
 
 def gpu_available() -> bool:
@@ -46,12 +44,12 @@ def gpu_available() -> bool:
         if gpu_count > 0:
             logger.info(f"Detected {gpu_count} GPU(s) via pynvml")
             return True
-    except Exception:  # noqa: BLE001,S110
+    except Exception:  # noqa: BLE001, S110
         pass
 
     # Method 2: Try nvidia-smi with short timeout
     try:
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(
             ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader,nounits"],  # noqa: S607
             capture_output=True,
             text=True,
@@ -62,7 +60,7 @@ def gpu_available() -> bool:
             gpu_count = int(result.stdout.strip())
             logger.info(f"Detected {gpu_count} GPU(s) via nvidia-smi")
             return gpu_count > 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError, OSError):
         pass
 
     logger.warning("No GPU detected")
@@ -96,35 +94,71 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     config._collected_items = items  # Store in config instead of global
 
 
-def _build_ray_command(temp_dir: str, num_cpus: int, num_gpus: int, object_store_memory: int) -> tuple[list[str], int]:
-    """Build the Ray start command with the given configuration."""
-    ray_port = find_free_port()
-    dashboard_port = find_free_port()
-    ray_client_server_port = find_free_port()
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:  # noqa: C901, PLR0912
+    m_opts = config.invocation_params.args
+    m_count = sum(arg == "-m" for arg in m_opts)
 
-    return [
-        "ray",
-        "start",
-        "--head",
-        "--disable-usage-stats",
-        "--port",
-        str(ray_port),
-        "--dashboard-port",
-        str(dashboard_port),
-        "--ray-client-server-port",
-        str(ray_client_server_port),
-        "--dashboard-host",
-        "0.0.0.0",  # noqa: S104
-        "--temp-dir",
-        str(temp_dir),
-        "--num-cpus",
-        str(num_cpus),
-        "--num-gpus",
-        str(num_gpus),
-        "--object-store-memory",
-        str(object_store_memory),
-        "--block",
-    ], ray_port
+    # At most one -m flag allowed
+    if m_count > 1:
+        msg = "At most one -m flag is allowed.\n"
+        msg += "Combine markers into a single boolean expression, e.g.:\n"
+        msg += '  pytest -m "not gpu and video"'
+        raise pytest.UsageError(msg)
+
+    selected = config.getoption("-m") or ""
+
+    # No -m expression → collect everything
+    if selected.strip() == "":
+        return False
+
+    # Determine which modalities (if any) were explicitly requested
+    selected_groups = set()
+
+    for group in MODALITY_GROUPS:
+        # Do not allow negating a modality
+        if re.search(rf"\bnot\s+{group}\b", selected):
+            msg = f"Negating a modality is not allowed: 'not {group}'."
+            raise pytest.UsageError(msg)
+
+        if re.search(rf"\b{group}\b", selected):
+            selected_groups.add(group)
+
+    # Do not allow multiple modalities to be selected at once
+    if len(selected_groups) > 1:
+        msg = f"Multiple modalities selected: {sorted(selected_groups)}. "
+        msg += "Please select only one modality at a time "
+        msg += f"({', '.join(MODALITY_GROUPS)})."
+        raise pytest.UsageError(msg)
+
+    # If no modality was requested → collect everything
+    if len(selected_groups) == 0:
+        return False
+
+    # If we reach this point, there should be exactly one modality selected
+    assert len(selected_groups) == 1
+
+    path_str = str(collection_path)
+
+    # 1. Directory-based detection
+    # e.g., if there is a subdirectory called "video", it is safe to assume it contains video tests only
+    for group in MODALITY_GROUPS:
+        if f"/{group}/" in path_str or path_str.endswith(f"{group}"):
+            return group not in selected_groups
+
+    # 2. File-based comment detection
+    # scan first 5 lines for: "# modality: video"
+    if collection_path.is_file() and collection_path.suffix == ".py":
+        try:
+            with open(collection_path, encoding="utf8") as f:
+                header = "".join([next(f) for _ in range(5)])
+        except StopIteration:
+            header = ""
+        for group in MODALITY_GROUPS:
+            if f"# modality: {group}" in header:
+                return group not in selected_groups
+
+    # Default → collect
+    return False
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -154,37 +188,31 @@ def shared_ray_cluster(tmp_path_factory: pytest.TempPathFactory, pytestconfig: p
         logger.error(error_msg)
         raise RuntimeError(error_msg)
 
-    # Set up Ray configuration values
     num_cpus = 11
     num_gpus = 2 if needs_gpu else 0
     object_store_memory = 2 * (1024**3)  # 2 GB
 
     logger.info(f"Configuring Ray cluster with {'GPU' if needs_gpu else 'CPU-only'} support")
 
-    # Create a temporary directory for Ray to avoid conflicts with other instances
     temp_dir = tmp_path_factory.mktemp("ray")
 
-    # Build and execute Ray command
-    cmd_to_run, ray_port = _build_ray_command(str(temp_dir), num_cpus, num_gpus, object_store_memory)
+    ray_client = RayClient(
+        num_cpus=num_cpus,
+        num_gpus=num_gpus,
+        object_store_memory=object_store_memory,
+        ray_temp_dir=str(temp_dir),
+        include_dashboard=False,
+    )
+    ray_client.start()
 
-    logger.info(f"Starting Ray cluster with {num_gpus} GPUs")
-    logger.info(f"Running Ray command: {' '.join(cmd_to_run)}")
-
-    # Use explicit path to ray command for security
-    ray_process = subprocess.Popen(cmd_to_run, shell=False)  # noqa: S603
-    logger.info(f"Started Ray process: {ray_process.pid}")
-
-    ray_address = f"localhost:{ray_port}"
-    os.environ["RAY_ADDRESS"] = ray_address
-    logger.info(f"Set RAY_ADDRESS for tests to: {ray_address}")
+    ray_address = os.environ["RAY_ADDRESS"]
+    logger.info(f"Ray cluster started at: {ray_address}")
 
     try:
         yield ray_address
     finally:
-        # Ensure cleanup happens even if tests fail
         logger.info("Shutting down Ray cluster")
-        ray_process.kill()
-        ray_process.wait()  # Wait for process to actually terminate
+        ray_client.stop()
 
 
 @pytest.fixture
